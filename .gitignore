@@ -4,4 +4,9 @@ node_modules/
 bin/
 obj/
 package-lock.json
-/src/.idea/.idea.QuickStart/.idea/workspace.xml
+*.tgz
+
+/src/edge-cs/obj/
+/src/edge-cs/bin/
+/src/Edge.js.CSharp/obj/
+/src/Edge.js.CSharp/bin/
