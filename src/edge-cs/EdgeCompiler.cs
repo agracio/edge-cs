@@ -1,54 +1,53 @@
-﻿using Microsoft.CSharp;
-using System;
-using System.CodeDom.Compiler;
+﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Emit;
 
+// ReSharper disable once CheckNamespace
 public class EdgeCompiler
 {
-    static readonly Regex referenceRegex = new Regex(@"^[\ \t]*(?:\/{2})?\#r[\ \t]+""([^""]+)""", RegexOptions.Multiline);
-    static readonly Regex usingRegex = new Regex(@"^[\ \t]*(using[\ \t]+[^\ \t]+[\ \t]*\;)", RegexOptions.Multiline);
-    static readonly bool debuggingEnabled = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("EDGE_CS_DEBUG"));
-    static readonly bool debuggingSelfEnabled = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("EDGE_CS_DEBUG_SELF"));
-    static readonly bool cacheEnabled = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("EDGE_CS_CACHE"));
-    static Dictionary<string, Dictionary<string, Assembly>> referencedAssemblies = new Dictionary<string, Dictionary<string, Assembly>>();
-    static Dictionary<string, Func<object, Task<object>>> funcCache = new Dictionary<string, Func<object, Task<object>>>();
+    private static readonly Regex ReferenceRegex = new Regex(@"^[\ \t]*(?:\/{2})?\#r[\ \t]+""([^""]+)""", RegexOptions.Multiline);
+    private static readonly Regex UsingRegex = new Regex(@"^[\ \t]*(using[\ \t]+[^\ \t]+[\ \t]*\;)", RegexOptions.Multiline);
+    private static readonly bool DebuggingEnabled = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("EDGE_CS_DEBUG"));
+    private static readonly bool DebuggingSelfEnabled = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("EDGE_CS_DEBUG_SELF"));
+    private static readonly bool CacheEnabled = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("EDGE_CS_CACHE"));
+    private static readonly ConcurrentDictionary<string, Func<object, Task<object>>> FuncCache = new ConcurrentDictionary<string, Func<object, Task<object>>>();
+    private static Func<Stream, Assembly> _assemblyLoader;
 
-    static EdgeCompiler()
+    public static void SetAssemblyLoader(Func<Stream, Assembly> assemblyLoader)
     {
-        AppDomain.CurrentDomain.AssemblyResolve += CurrentDomain_AssemblyResolve;
+        _assemblyLoader = assemblyLoader;
     }
 
-    static Assembly CurrentDomain_AssemblyResolve(object sender, ResolveEventArgs args)
+    public void DebugMessage(string format, params object[] args)
     {
-        Assembly result = null;
-        Dictionary<string, Assembly> requesting;
-        if (referencedAssemblies.TryGetValue(args.RequestingAssembly.FullName, out requesting))
+        if (DebuggingSelfEnabled)
         {
-            requesting.TryGetValue(args.Name, out result);
+            //Console.WriteLine(format, args);
         }
-
-        return result;
     }
 
-    public Func<object, Task<object>> CompileFunc(IDictionary<string, object> parameters)
+    public Func<object, Task<object>> CompileFunc(IDictionary<string, object> parameters, IDictionary<string, string> compileAssemblies)
     {
-        string source = (string)parameters["source"];
+        DebugMessage("EdgeCompiler::CompileFunc (CLR) - Starting");
+
+        string source = (string) parameters["source"];
         string lineDirective = string.Empty;
         string fileName = null;
         int lineNumber = 1;
 
-        // read source from file
-        if (source.EndsWith(".cs", StringComparison.InvariantCultureIgnoreCase)
-            || source.EndsWith(".csx", StringComparison.InvariantCultureIgnoreCase))
+        // Read source from file
+        if (source.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) || source.EndsWith(".csx", StringComparison.OrdinalIgnoreCase))
         {
-            // retain fileName for debugging purposes
-            if (debuggingEnabled)
+            // Retain filename for debugging purposes
+            if (DebuggingEnabled)
             {
                 fileName = source;
             }
@@ -56,185 +55,232 @@ public class EdgeCompiler
             source = File.ReadAllText(source);
         }
 
-        if (debuggingSelfEnabled)
+        DebugMessage("EdgeCompiler::CompileFunc (CLR) - Func cache size: {0}", FuncCache.Count);
+
+        string originalSource = source;
+
+        if (FuncCache.ContainsKey(originalSource))
         {
-            Console.WriteLine("Func cache size: " + funcCache.Count);
+            DebugMessage("EdgeCompiler::CompileFunc (CLR) - Serving func from cache");
+            return FuncCache[originalSource];
         }
 
-        var originalSource = source;
-        if (funcCache.ContainsKey(originalSource))
-        {
-            if (debuggingSelfEnabled)
-            {
-                Console.WriteLine("Serving func from cache.");
-            }
+        DebugMessage("EdgeCompiler::CompileFunc (CLR) - Func not found in cache, compiling");
 
-            return funcCache[originalSource];
-        }
-        else if (debuggingSelfEnabled)
+        // Add assembly references provided explicitly through parameters, along with some default ones
+        List<string> references = new List<string>
         {
-            Console.WriteLine("Func not found in cache. Compiling.");
-        }
+            "System.Runtime",
+            "System.Threading.Tasks",
+            "System.Dynamic.Runtime",
+            "Microsoft.CSharp"
+        };
 
-        // add assembly references provided explicitly through parameters
-        List<string> references = new List<string>();
-        object v;
-        if (parameters.TryGetValue("references", out v))
+        object providedReferences;
+
+        if (parameters.TryGetValue("references", out providedReferences))
         {
-            foreach (object reference in (object[])v)
+            foreach (object reference in (object[]) providedReferences)
             {
                 references.Add((string)reference);
             }
         }
 
-        // add assembly references provided in code as [//]#r "assemblyname" lines
-        Match match = referenceRegex.Match(source);
+        // Add assembly references provided in code as [//]#r "assembly name" lines
+        Match match = ReferenceRegex.Match(source);
+
         while (match.Success)
         {
             references.Add(match.Groups[1].Value);
             source = source.Substring(0, match.Index) + source.Substring(match.Index + match.Length);
-            match = referenceRegex.Match(source);
+            match = ReferenceRegex.Match(source);
         }
 
-        if (debuggingEnabled)
+        if (DebuggingEnabled)
         {
             object jsFileName;
+
             if (parameters.TryGetValue("jsFileName", out jsFileName))
             {
-                fileName = (string)jsFileName;
-                lineNumber = (int)parameters["jsLineNumber"];
+                fileName = (string) jsFileName;
+                lineNumber = (int) parameters["jsLineNumber"];
             }
-            
-            if (!string.IsNullOrEmpty(fileName)) 
+
+            if (!string.IsNullOrEmpty(fileName))
             {
-                lineDirective = string.Format("#line {0} \"{1}\"\n", lineNumber, fileName);
+                lineDirective = $"#line {lineNumber} \"{fileName.Replace("\\", "\\\\")}\"\n";
             }
         }
 
-        // try to compile source code as a class library
+        // Try to compile source code as a class library
         Assembly assembly;
         string errorsClass;
-        if (!this.TryCompile(lineDirective + source, references, out errorsClass, out assembly))
-        {
-            // try to compile source code as an async lambda expression
 
-            // extract using statements first
+        if (!TryCompile(lineDirective + source, references, compileAssemblies, out errorsClass, out assembly))
+        {
+            // Try to compile source code as an async lambda expression
+
+            // Extract using statements first
             string usings = "";
-            match = usingRegex.Match(source);
+            match = UsingRegex.Match(source);
+
             while (match.Success)
             {
                 usings += match.Groups[1].Value;
                 source = source.Substring(0, match.Index) + source.Substring(match.Index + match.Length);
-                match = usingRegex.Match(source);
+                match = UsingRegex.Match(source);
             }
 
             string errorsLambda;
-            source = 
-                usings + "using System;\n"
-                + "using System.Threading.Tasks;\n"
-                + "public class Startup {\n"
-                + "    public async Task<object> Invoke(object ___input) {\n"
-                + lineDirective
-                + "        Func<object, Task<object>> func = " + source + ";\n"
-                + "#line hidden\n"
-                + "        return await func(___input);\n"
-                + "    }\n"
-                + "}";
+            source = usings + @"
+using System;
+using System.Threading.Tasks;
 
-            if (debuggingSelfEnabled)
-            {
-                Console.WriteLine("Edge-cs trying to compile async lambda expression:");
-                Console.WriteLine(source);
-            }
+public class Startup 
+{
+    public async Task<object> Invoke(object ___input) 
+    {
+" + lineDirective + @"
+        Func<object, Task<object>> func = " + source + @";
+#line hidden
+        return await func(___input);
+    }
+}";
 
-            if (!TryCompile(source, references, out errorsLambda, out assembly))
+            DebugMessage("EdgeCompiler::CompileFunc (CLR) - Trying to compile async lambda expression:{0}{1}", Environment.NewLine, source);
+
+            if (!TryCompile(source, references, compileAssemblies, out errorsLambda, out assembly))
             {
-                throw new InvalidOperationException(
-                    "Unable to compile C# code.\n----> Errors when compiling as a CLR library:\n"
-                    + errorsClass
-                    + "\n----> Errors when compiling as a CLR async lambda expression:\n"
-                    + errorsLambda);
+                throw new InvalidOperationException("Unable to compile C# code.\n----> Errors when compiling as a CLR library:\n" + errorsClass +
+                                                    "\n----> Errors when compiling as a CLR async lambda expression:\n" + errorsLambda);
             }
         }
 
-        // store referenced assemblies to help resolve them at runtime from AppDomain.AssemblyResolve
-        referencedAssemblies[assembly.FullName] = new Dictionary<string, Assembly>();
-        foreach (var reference in references)
+        // Extract the entry point to a class method
+        Type startupType = assembly.GetType((string) parameters["typeName"]);
+
+        if (startupType == null)
         {
-            try
-            {
-                var referencedAssembly = Assembly.UnsafeLoadFrom(reference);
-                referencedAssemblies[assembly.FullName][referencedAssembly.FullName] = referencedAssembly;
-            }
-            catch
-            {
-                // empty - best effort
-            }
+            throw new TypeLoadException("Could not load type '" + (string) parameters["typeName"] + "'");
         }
 
-        // extract the entry point to a class method
-        Type startupType = assembly.GetType((string)parameters["typeName"], true, true);
-        object instance = Activator.CreateInstance(startupType, false);
-        MethodInfo invokeMethod = startupType.GetMethod((string)parameters["methodName"], BindingFlags.Instance | BindingFlags.Public);
+        object instance = Activator.CreateInstance(startupType);
+        MethodInfo invokeMethod = startupType.GetMethod((string) parameters["methodName"], BindingFlags.Instance | BindingFlags.Public);
+
         if (invokeMethod == null)
         {
             throw new InvalidOperationException("Unable to access CLR method to wrap through reflection. Make sure it is a public instance method.");
         }
 
-        // create a Func<object,Task<object>> delegate around the method invocation using reflection
-        Func<object,Task<object>> result = (input) => 
+        // Ereate a Func<object,Task<object>> delegate around the method invocation using reflection
+        Func<object, Task<object>> result = input => (Task<object>) invokeMethod.Invoke(instance, new object[]
         {
-            return (Task<object>)invokeMethod.Invoke(instance, new object[] { input });
-        };
+            input
+        });
 
-        if (cacheEnabled)
+        if (CacheEnabled)
         {
-            funcCache[originalSource] = result;
+            FuncCache[originalSource] = result;
         }
 
         return result;
     }
 
-    bool TryCompile(string source, List<string> references, out string errors, out Assembly assembly)
+    private bool TryCompile(string source, List<string> references, IDictionary<string, string> compileAssemblies, out string errors, out Assembly assembly)
     {
-        bool result = false;
         assembly = null;
         errors = null;
 
-        Dictionary<string, string> options = new Dictionary<string, string> { { "CompilerVersion", "v4.0" } };
-        CSharpCodeProvider csc = new CSharpCodeProvider(options);
-        CompilerParameters parameters = new CompilerParameters();
-        parameters.GenerateInMemory = true;
-        parameters.IncludeDebugInformation = debuggingEnabled;
-        parameters.ReferencedAssemblies.AddRange(references.ToArray());
-        parameters.ReferencedAssemblies.Add("System.dll");
-        parameters.ReferencedAssemblies.Add("System.Core.dll");
-        parameters.ReferencedAssemblies.Add("Microsoft.CSharp.dll");
-        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("EDGE_CS_TEMP_DIR")))
+        string projectDirectory = Environment.GetEnvironmentVariable("EDGE_APP_ROOT") ?? Directory.GetCurrentDirectory();
+
+        SyntaxTree syntaxTree = CSharpSyntaxTree.ParseText(source);
+        List<MetadataReference> metadataReferences = new List<MetadataReference>();
+
+        DebugMessage("EdgeCompiler::TryCompile (CLR) - Resolving {0} references", references.Count);
+
+        // Search the NuGet package repository for each reference
+        foreach (string reference in references)
         {
-            parameters.TempFiles = new TempFileCollection(Environment.GetEnvironmentVariable("EDGE_CS_TEMP_DIR"));
-        }
-        CompilerResults results = csc.CompileAssemblyFromSource(parameters, source);
-        if (results.Errors.HasErrors)
-        {
-            foreach (CompilerError error in results.Errors)
+            DebugMessage("EdgeCompiler::TryCompile (CLR) - Searching for {0}", reference);
+
+            // If the reference looks like a filename, try to load it directly; if we fail and the reference name does not contain a path separator (like
+            // System.Data.dll), we fall back to stripping off the extension and treating the reference like a NuGet package
+            if (reference.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
             {
-                if (errors == null)
+                if (reference.Contains(Path.DirectorySeparatorChar.ToString()))
                 {
-                    errors = error.ToString();
+                    metadataReferences.Add(MetadataReference.CreateFromFile(Path.IsPathRooted(reference)
+                        ? reference
+                        : Path.Combine(projectDirectory, reference)));
+                    continue;
                 }
-                else
+
+                if (File.Exists(Path.Combine(projectDirectory, reference)))
                 {
-                    errors += "\n" + error.ToString();
+                    metadataReferences.Add(MetadataReference.CreateFromFile(Path.Combine(projectDirectory, reference)));
+                    continue;
                 }
             }
-        }
-        else
-        {
-            assembly = results.CompiledAssembly;
-            result = true;
+
+            string referenceName = reference.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                ? reference.Substring(0, reference.Length - 4)
+                : reference;
+
+            if (!compileAssemblies.ContainsKey(referenceName))
+            {
+                throw new Exception(String.Format("Unable to resolve reference to {0}.", referenceName));
+            }
+
+            DebugMessage("EdgeCompiler::TryCompile (CLR) - Reference to {0} resolved to {1}", referenceName, compileAssemblies[referenceName]);
+            metadataReferences.Add(MetadataReference.CreateFromFile(compileAssemblies[referenceName]));
+            metadataReferences.Add(MetadataReference.CreateFromFile(typeof(object).Assembly.Location));
+            metadataReferences.Add(MetadataReference.CreateFromFile(typeof(System.Runtime.CompilerServices.DynamicAttribute).Assembly.Location));
         }
 
-        return result;
+        CSharpCompilationOptions compilationOptions = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: DebuggingEnabled
+            ? OptimizationLevel.Debug
+            : OptimizationLevel.Release);
+
+        DebugMessage("EdgeCompiler::TryCompile (CLR) - Starting compilation");
+
+        CSharpCompilation compilation = CSharpCompilation.Create(Guid.NewGuid() + ".dll", new SyntaxTree[]
+        {
+            syntaxTree
+        }, metadataReferences, compilationOptions);
+
+        using (MemoryStream memoryStream = new MemoryStream())
+        {
+            EmitResult compilationResults = compilation.Emit(memoryStream);
+
+            if (!compilationResults.Success)
+            {
+                IEnumerable<Diagnostic> failures =
+                    compilationResults.Diagnostics.Where(
+                        diagnostic =>
+                            diagnostic.IsWarningAsError || diagnostic.Severity == DiagnosticSeverity.Error || diagnostic.Severity == DiagnosticSeverity.Warning);
+
+                foreach (Diagnostic diagnostic in failures)
+                {
+                    if (errors == null)
+                    {
+                        errors = String.Format("{0}: {1}", diagnostic.Id, diagnostic.GetMessage());
+                    }
+
+                    else
+                    {
+                        errors += String.Format("\n{0}: {1}", diagnostic.Id, diagnostic.GetMessage());
+                    }
+                }
+
+                DebugMessage("EdgeCompiler::TryCompile (CLR) - Compilation failed with the following errors: {0}{1}", Environment.NewLine, errors);
+                return false;
+            }
+
+            memoryStream.Seek(0, SeekOrigin.Begin);
+            assembly = _assemblyLoader(memoryStream);
+
+            DebugMessage("EdgeCompiler::TryCompile (CLR) - Compilation completed successfully");
+            return true;
+        }
     }
 }
