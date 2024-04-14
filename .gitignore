@@ -8,5 +8,5 @@ package-lock.json
 
 /src/edge-cs/obj/
 /src/edge-cs/bin/
-/src/Edge.js.CSharp/obj/
-/src/Edge.js.CSharp/bin/
+/src/edge-cs-coreclr/obj/
+/src/edge-cs-coreclr/bin/
