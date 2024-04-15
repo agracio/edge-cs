@@ -37,6 +37,12 @@ public class EdgeCompiler
     {
         DebugMessage("EdgeCompiler::CompileFunc (CLR) - Starting");
 
+        DebugMessage("EdgeCompiler::CompileFunc (CLR) - Parameters");
+        foreach (var key in parameters.Keys)
+        {
+            DebugMessage("EdgeCompiler::CompileFunc (CLR) - {0}: {1}", key, parameters[key].ToString());
+        }
+
         string source = (string) parameters["source"];
         string lineDirective = string.Empty;
         string fileName = null;
@@ -71,13 +77,11 @@ public class EdgeCompiler
         {
             "System.Runtime",
             "System.Threading.Tasks",
-            "System.Dynamic.Runtime",
+            //"System.Dynamic.Runtime",
             "Microsoft.CSharp"
         };
 
-        object providedReferences;
-
-        if (parameters.TryGetValue("references", out providedReferences))
+        if (parameters.TryGetValue("references", out var providedReferences))
         {
             foreach (object reference in (object[]) providedReferences)
             {
