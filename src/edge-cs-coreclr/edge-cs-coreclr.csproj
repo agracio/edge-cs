@@ -10,9 +10,13 @@
     <PackageLicenseUrl>https://github.com/agracio/edge-cs/blob/master/LICENSE</PackageLicenseUrl>
     <LangVersion>default</LangVersion>
     <Nullable>disable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.CSharp" Version="4.7.0" />
     <PackageReference Include="Microsoft.CodeAnalysis" Version="4.9.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\edge-cs-base\edge-cs-base.csproj" />
   </ItemGroup>
 </Project>
