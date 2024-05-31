@@ -47,7 +47,7 @@ public class EdgeCompilerBase
         DebugMessage($"EdgeCompiler::CompileFunc ({Framework}) - Parameters");
         foreach (var key in parameters.Keys)
         {
-            DebugMessage($"EdgeCompiler::CompileFunc ({Framework}) - {0}: {1}", key, parameters[key].ToString());
+            DebugMessage($"EdgeCompiler::CompileFunc ({Framework}) - {0}: {1}", key, parameters[key]);
         }
 
         var source = (string) parameters["source"];
